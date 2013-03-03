@@ -1,0 +1,551 @@
+
+<html><head><meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-1">
+<title>WebGL - Layered Spectrum </title>
+
+<!-- Dancer.js -->
+<script type="text/javascript" src="dlib/src/dancer.js"></script>
+<script type="text/javascript" src="dlib/src/support.js"></script>
+<script type="text/javascript" src="dlib/src/kick.js"></script>
+<script type="text/javascript" src="dlib/src/adapterWebkit.js"></script>
+<script type="text/javascript" src="dlib/src/adapterMoz.js"></script>
+<script type="text/javascript" src="dlib/src/adapterFlash.js"></script>
+<script type="text/javascript" src="dlib/lib/fft.js"></script>
+<script type="text/javascript" src="dlib/lib/flash_detect.js"></script>
+<script type="text/javascript" src="dlib/plugins/dancer.fft.js"></script>
+<script type="text/javascript" src="dlib/plugins/dancer.waveform.js"></script>
+<!-- Demo stuff -->
+    
+<script type="text/javascript" src="demos/waveform2/webgl_extern/glMatrix-0.9.5.min.js"></script>
+<script type="text/javascript" src="demos/common/webgl-utils.js"></script>
+
+
+<script id="shader-fs" type="x-shader/x-fragment">
+    precision mediump float;
+    varying vec4 vColor;
+
+    void main(void) {
+        gl_FragColor = vColor;
+    }
+</script>
+
+<script id="shader-vs" type="x-shader/x-vertex">
+    attribute vec3 aVertexPosition;
+    attribute vec4 aVertexColor;
+
+    uniform mat4 uMVMatrix;
+    uniform mat4 uPMatrix;
+    varying vec4 vColor;
+
+    void main(void) {
+        gl_Position = uPMatrix * uMVMatrix * vec4(aVertexPosition, 1.0);
+        vColor = aVertexColor;
+    }
+</script>
+
+
+<script type="text/javascript">
+
+    var gl;
+    var dancer;
+    var g_requestId;
+    var canvas;
+    var bufferSize = 256;
+    var streamSize = 128;
+    var verticesPerStreamSample = 4;
+    var kickBufferSize = 100;
+    var zLineBufferSize = 100;
+    var zLineStreamSize = 1024;
+    
+    var waveform_wavelen   = 5;
+    var waveform_ampl = 1000;
+    
+    var waveBuffer;
+    var waveBufferData;
+    var currentColorBuffer;
+    var colorBufferData;
+    
+    var kickWaveBuffer;
+    var kickWaveBufferData = new Array(kickBufferSize);
+    var kickColorBuffer;
+    var kickColorBufferData;
+    var kickOn = false;
+    var kickAccel = false;
+    var kickAccelVal = 1;
+    
+    var zLineBuffer;
+    var zLineBufferData = new Array(zLineBufferSize);
+    var zLineColorBuffer;
+    var zLineColorBufferData;
+    
+    var currentIteration = 0;
+    var currentKickIndex = 0;
+    var currentLocation;
+    var g_startTime = new Date();
+    var speed = 2;
+    var currentPosition = 0;
+
+    var cameraHeight = 205;
+    var cameraClip = 250000;
+    
+    function setupdjs(){
+        var
+        AUDIO_FILE = 'dlib/examples/songs/zircon_devils_spirit'
+        waveform = null;
+        /*
+         * Dancer.js magic
+         */
+        Dancer.setOptions({
+                          flashSWF : '../../dlib/lib/soundmanager2.swf',
+                          flashJS  : '../../dlib/lib/soundmanager2.js'
+                          });
+        
+        dancer = new Dancer();
+        kick = dancer.createKick({
+                                 onKick: function () {
+                                    kickAccel = true;
+                                 kickOn = true;
+                                 },
+                                 offKick: function(){
+                                 kickOn = false;
+                                 }
+                                 }).on();
+        
+        dancer
+        .load({ src: AUDIO_FILE, codecs: [ 'ogg', 'mp3' ]});
+
+//        dancer.setVolume(0);
+        
+    }
+    
+    function initGL(canvas) {
+        try {
+            gl = canvas.getContext("webkit-3d");
+            gl.viewportWidth = canvas.width;
+            gl.viewportHeight = canvas.height;
+        } catch (e) {
+        }
+        if (!gl) {
+            alert("Could not initialise WebGL, sorry :-(");
+        }
+    }
+
+
+    function getShader(gl, id) {
+        var shaderScript = document.getElementById(id);
+        if (!shaderScript) {
+            return null;
+        }
+
+        var str = "";
+        var k = shaderScript.firstChild;
+        while (k) {
+            if (k.nodeType == 3) {
+                str += k.textContent;
+            }
+            k = k.nextSibling;
+        }
+
+        var shader;
+        if (shaderScript.type == "x-shader/x-fragment") {
+            shader = gl.createShader(gl.FRAGMENT_SHADER);
+        } else if (shaderScript.type == "x-shader/x-vertex") {
+            shader = gl.createShader(gl.VERTEX_SHADER);
+        } else {
+            return null;
+        }
+
+        gl.shaderSource(shader, str);
+        gl.compileShader(shader);
+
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            alert(gl.getShaderInfoLog(shader));
+            return null;
+        }
+
+        return shader;
+    }
+
+
+    var shaderProgram;
+
+    function initShaders() {
+        var fragmentShader = getShader(gl, "shader-fs");
+        var vertexShader = getShader(gl, "shader-vs");
+
+        shaderProgram = gl.createProgram();
+        gl.attachShader(shaderProgram, vertexShader);
+        gl.attachShader(shaderProgram, fragmentShader);
+        gl.linkProgram(shaderProgram);
+
+        if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+            alert("Could not initialise shaders");
+        }
+
+        gl.useProgram(shaderProgram);
+
+        shaderProgram.vertexPositionAttribute = gl.getAttribLocation(shaderProgram, "aVertexPosition");
+        gl.enableVertexAttribArray(shaderProgram.vertexPositionAttribute);
+
+        shaderProgram.vertexColorAttribute = gl.getAttribLocation(shaderProgram, "aVertexColor");
+        gl.enableVertexAttribArray(shaderProgram.vertexColorAttribute);
+
+        
+        shaderProgram.pMatrixUniform = gl.getUniformLocation(shaderProgram, "uPMatrix");
+        shaderProgram.mvMatrixUniform = gl.getUniformLocation(shaderProgram, "uMVMatrix");
+    }
+
+
+    var mvMatrix = mat4.create();
+    var pMatrix = mat4.create();
+
+    function setMatrixUniforms() {
+        gl.uniformMatrix4fv(shaderProgram.pMatrixUniform, false, pMatrix);
+        gl.uniformMatrix4fv(shaderProgram.mvMatrixUniform, false, mvMatrix);
+    }
+
+    
+    var original = [30.0/255,144.0/255,215.0/255,1.0];
+    
+    function initBuffers() {
+        
+        waveformBuffer = gl.createBuffer();
+        waveformBuffer.numItems = streamSize*verticesPerStreamSample;
+        waveformBuffer.itemSize = 3;
+        
+        waveBufferData = new Array();
+        
+        for(var i = 0; i<bufferSize; i++){
+            waveBufferData[i] = new Float32Array(3*streamSize*verticesPerStreamSample);
+        }
+        
+        currentColorBuffer = gl.createBuffer();
+        currentColorBuffer.itemSize = 4;
+        currentColorBuffer.numItems = streamSize*verticesPerStreamSample;
+        colorBufferData = new Float32Array(currentColorBuffer.numItems*4);
+        
+        for(var i = 0; i<colorBufferData.length; i++){
+            colorBufferData[i] = original[i%4];
+        }
+        
+        // Kicks //
+        
+        for(var i = 0; i<kickBufferSize; i++){
+            kickWaveBufferData[i] = new Float32Array(3*streamSize*verticesPerStreamSample);
+        }
+        
+        kickWaveBuffer = gl.createBuffer();
+        kickWaveBuffer.itemSize = 3;
+        kickWaveBuffer.numItems = streamSize*verticesPerStreamSample;
+        
+        kickColorBuffer = gl.createBuffer();
+        kickColorBuffer.itemSize = 4;
+        kickColorBuffer.numItems = streamSize*verticesPerStreamSample;
+        kickColorBufferData = new Float32Array(kickColorBuffer.numItems*4);
+        
+        for(var i = 0; i<kickColorBufferData.length; i++){
+            
+            if(i%4==0){
+                kickColorBufferData[i] = 180/255;
+            }else if(i%4==1){
+                kickColorBufferData[i] = 80.0/255;
+            }else if(i%4==2){
+                kickColorBufferData[i] = 0;
+            }else if(i%4==3){
+                kickColorBufferData[i] = 1;
+            }
+        }
+
+        // Z-Line Buffer
+        
+        zLineBuffer = gl.createBuffer();
+        zLineBuffer.itemSize = 3;
+        zLineBuffer.numItems = zLineStreamSize;
+        
+        for(var i = 0; i<zLineBufferSize; i++){
+            zLineBufferData[i] = new Float32Array(zLineBuffer.itemSize * zLineBuffer.numItems);
+        }
+        
+        zLineColorBuffer = gl.createBuffer();
+        zLineColorBuffer.itemSize = 4;
+        zLineColorBuffer.numItems = 2;
+
+        zLineColorBufferData = new Float32Array(4*zLineStreamSize);
+        
+        for(var i = 0; i<zLineColorBufferData.length; i++){
+            if(i%4 == 0){
+                zLineColorBufferData[i] = 70.0/255;
+            }else if(i%4==1){
+                zLineColorBufferData[i] = 30.0/255;
+            }else if(i%4==2){
+                zLineColorBufferData[i] = 180.0/255;
+            }else if(i%4==3){
+                zLineColorBufferData[i] = 1;
+            }
+        }
+        
+    }
+
+    function yForZ(z){
+        return 40*Math.sin(z/350);
+    }
+
+    function drawVisualization(){
+        
+        var waveform = dancer.getWaveform();
+        var spectrum = dancer.getSpectrum();
+        
+        if(waveform==null){return;}
+                
+        currentIteration++;
+        
+        var index = currentIteration % bufferSize;
+        
+        currentWaveformBufferData = waveBufferData[index];
+        
+        var lwm = 1;
+        if(kickAccelVal > 5){
+            lwm = kickAccelVal/5.0;
+            if(lwm > 1.3){
+                lwm = 1.3;
+            }
+        }
+        
+        gl.lineWidth(3*speed/10.0);
+        
+        
+        var kickThis = false;
+        var kwf = kickWaveBufferData[currentKickIndex%kickBufferSize];;
+        
+        //turn on kick
+        if(kickAccelVal>3 || kickOn){
+            kickThis = true;
+            currentKickIndex++;
+        }
+        
+        var curX = -((streamSize)*waveform_wavelen)/2;
+        
+        // Buffer Leading Waveform //
+        
+        for ( var i = 0,  j = 0, l = spectrum.length; i < l && i < streamSize; i++,j+=12) {
+
+            for(var k = j; k<j+12; k+=3){
+                if(((k-j)/3) % 2 == 0){
+                    curX += waveform_wavelen;
+                }
+                
+                var x = curX;
+                var y = spectrum[i] * waveform_ampl;
+                
+                //flatline edges
+                if(i <= 1){
+                    x = curX - 1000 + (i*1000);
+                    y = 0;
+                }else if(i >= streamSize-2){
+                    x = curX + (100*i);
+                    y = 0;
+                }
+                
+                if(kickThis){
+                    kwf[k] = x;
+                    kwf[k+1] = y+yForZ(-currentPosition);
+                    kwf[k+2] = -currentPosition;
+                }else{
+                    currentWaveformBufferData[k] = x;
+                    currentWaveformBufferData[k+1] = y + yForZ(-currentPosition);
+                    currentWaveformBufferData[k+2] = -currentPosition;
+                }
+            }
+    
+        }
+        
+        // Waveform Color //
+        
+        gl.bindBuffer(gl.ARRAY_BUFFER, currentColorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, colorBufferData, gl.STATIC_DRAW);
+    
+        for(var i = 2; i<streamSize*4*verticesPerStreamSample; i+=4){
+            var index = i%4;
+            var orig = original[index];
+        
+            if(kickAccelVal>0.05 && index%2==0){
+                if(kickOn){
+                    orig *= 5;
+                }else{
+                    orig *= (kickAccelVal+1);
+                }
+            }
+            
+            colorBufferData[i] = orig;
+        }
+        
+        gl.vertexAttribPointer(shaderProgram.vertexColorAttribute, currentColorBuffer.itemSize, gl.FLOAT, false, 0, 0);
+         
+        // Draw Waveforms //
+        
+        for(var k = 0; k<bufferSize; k++){
+        
+            var currentWaveformBufferData = waveBufferData[k];
+            mat4.identity(mvMatrix);
+            
+            gl.bindBuffer(gl.ARRAY_BUFFER, waveformBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER,(currentWaveformBufferData),gl.STATIC_DRAW);
+            
+            for(var l = 0; l<streamSize*verticesPerStreamSample*3; l+=3){
+                currentWaveformBufferData[l] += waveform[l] * 1.5;
+                currentWaveformBufferData[l+1] += waveform[l] * 6;
+            }
+            
+            gl.vertexAttribPointer(shaderProgram.vertexPositionAttribute, waveformBuffer.itemSize, gl.FLOAT, false, 0, 0);
+            setMatrixUniforms();
+            gl.drawArrays(gl.LINE_STRIP, 0, waveformBuffer.numItems);
+            
+        }
+        
+        // Draw Z Lines //
+        
+        
+        //Z line color
+        
+        gl.bindBuffer(gl.ARRAY_BUFFER, zLineColorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, zLineColorBufferData, gl.STATIC_DRAW);
+        gl.vertexAttribPointer(shaderProgram.vertexColorAttribute, zLineColorBuffer.itemSize, gl.FLOAT, false, 0, 0);
+
+        //Z line waveform
+
+        var zLineGap = 20;
+        curX = -(zLineGap*zLineBufferSize)/2;
+
+        var stepping = 5;
+        
+        gl.lineWidth(3);
+        
+        for(var k = 0; k<zLineBufferSize; k++){
+            
+            var currentWaveformBufferData = zLineBufferData[k];
+            
+            var l;
+            for(l = 0, m = zLineStreamSize-1,n = 0; l<zLineBuffer.numItems * 3-3; l+=3, m--,n++){
+                currentWaveformBufferData[l] = curX + waveform[m]*20;
+                var curZ = -currentPosition+1550 - (n*stepping);
+                currentWaveformBufferData[l+1] = yForZ(curZ);
+                currentWaveformBufferData[l+2] = curZ;
+            }
+            
+            l = zLineBuffer.numItems*3-3;
+            currentWaveformBufferData[l] = curX;
+            currentWaveformBufferData[l+1] = 0;
+            currentWaveformBufferData[l+2] = -currentPosition - cameraClip-200;
+            
+            mat4.identity(mvMatrix);
+            gl.bindBuffer(gl.ARRAY_BUFFER, zLineBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER,currentWaveformBufferData,gl.STATIC_DRAW);
+            gl.vertexAttribPointer(shaderProgram.vertexPositionAttribute, zLineBuffer.itemSize, gl.FLOAT, false, 0, 0);
+            setMatrixUniforms();
+            gl.drawArrays(gl.LINE_STRIP, 0,zLineBuffer.numItems);
+            
+            curX += zLineGap;
+            
+        }
+        
+        // Draw Kicks //
+                
+        //Kick Color
+        
+        gl.bindBuffer(gl.ARRAY_BUFFER, kickColorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, (kickColorBufferData), gl.STATIC_DRAW);
+                
+        gl.vertexAttribPointer(shaderProgram.vertexColorAttribute, kickColorBuffer.itemSize, gl.FLOAT, false, 0, 0);
+        
+        //Kick Vertices
+        
+        gl.lineWidth(speed);
+        
+        for(var k = 0; k<kickBufferSize;k++){
+            
+            var currentWaveform = kickWaveBufferData[k];
+            
+            for(var l = 0; l<streamSize*verticesPerStreamSample*3; l+=3){
+                currentWaveform[l] += waveform[l] * 1.5;
+                currentWaveform[l+1] += waveform[l] * 6;
+            }
+            
+            mat4.identity(mvMatrix);
+            gl.bindBuffer(gl.ARRAY_BUFFER, kickWaveBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER,currentWaveform,gl.STATIC_DRAW);
+            gl.vertexAttribPointer(shaderProgram.vertexPositionAttribute, kickWaveBuffer.itemSize, gl.FLOAT, false, 0, 0);
+            setMatrixUniforms();
+            gl.drawArrays(gl.LINE_STRIP, 0,kickWaveBuffer.numItems);
+        }
+    
+        
+    }
+    
+    function drawScene() {
+
+        var cameraClock = (new Date().getTime() - g_startTime.getTime()) / 1000.0 * 0.3;
+
+        gl.viewport(0, 0, gl.viewportWidth, gl.viewportHeight);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        mat4.identity(pMatrix);
+        mat4.perspective(45, 1, 0.1, cameraClip, pMatrix);
+        mat4.rotate(pMatrix, 3.14159/9  , [1,0,0], pMatrix);
+        mat4.rotate(pMatrix,Math.sin(cameraClock)/10,[0,1,0],pMatrix);
+        
+        speed = 6*(Math.sin(cameraClock)+1)+2;
+        
+        if(speed<3.5){
+            speed = 3.5;
+        }
+        
+        if(kickAccel){
+                
+            kickAccelVal *= 4.5;
+            if(kickAccelVal >= 11){
+                kickAccel = false;
+            }
+        }else if(kickAccelVal > 0.05){
+            kickAccelVal /= 1.5;
+        }
+        
+        speed += kickAccelVal;
+        currentPosition += speed;
+        
+        var cameraZ = -1550+currentPosition + 200 * Math.cos(cameraClock);
+        mat4.translate(pMatrix,[0,-cameraHeight + yForZ(cameraZ),cameraZ],pMatrix);
+  
+        drawVisualization();
+        
+        g_requestId = window.requestAnimFrame(drawScene, canvas);
+
+    }
+
+
+
+    function webGLStart() {
+        canvas = document.getElementById("canvas");
+        setupdjs();
+        initGL(canvas);
+        initShaders();
+        initBuffers();
+
+        gl.clearColor(0.0, 0.0, 0.0, 1.0);
+        gl.enable(gl.DEPTH_TEST);
+
+        drawScene();
+        dancer.play();
+
+    }
+
+
+</script>
+
+
+</head>
+
+
+<body onload="webGLStart();">
+
+    <center> <canvas id="canvas" style="border: none;" width="1440" height="900"></canvas></center>
+
+
+</body></html>
